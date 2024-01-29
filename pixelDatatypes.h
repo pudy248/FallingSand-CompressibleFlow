@@ -3,61 +3,15 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
-struct PixelData
+#include "Vector.h"
+
+#include <stdint.h>
+
+enum Material : uint8_t
 {
-	uint8_t id = 0;
-	bool updated = false;
-	uint8_t density = 0;
-
-	int lifetime = -1;
-
-	bool flammable = false;
-
-	__host__ __device__ constexpr PixelData()
-	{
-		id = 0;
-		updated = false;
-		density = 0;
-	}
-
-	__host__ __device__ constexpr PixelData(const uint8_t _id)
-	{
-		id = _id;
-		updated = false;
-		density = 0;
-	}
-
-	__host__ __device__ constexpr PixelData(const uint8_t _id, const uint8_t _density)
-	{
-		id = _id;
-		updated = false;
-		density = _density;
-	}
-
-
-	__host__ __device__ constexpr PixelData(const uint8_t _id, const uint8_t _density, const bool _flammable)
-	{
-		id = _id;
-		updated = false;
-		density = _density;
-		flammable = _flammable;
-	}
-
-	__host__ __device__ constexpr PixelData(const uint8_t _id, const uint8_t _density, const bool _flammable, const int _lifetime)
-	{
-		id = _id;
-		updated = false;
-		density = _density;
-		flammable = _flammable;
-		lifetime = _lifetime;
-	}
-};
-
-struct ChunkData
-{
-	bool lastUpdated;
-	bool updated;
-	bool reactionUpdated;
+	AIR,
+	SAND,
+	WALL
 };
 
 struct RGBA
@@ -67,7 +21,7 @@ struct RGBA
 	uint8_t b = 0;
 	uint8_t a = 255;
 
-	__host__ __device__ constexpr RGBA()
+	__device__ constexpr RGBA()
 	{
 		r = 0;
 		g = 0;
@@ -75,7 +29,7 @@ struct RGBA
 		a = 255;
 	}
 
-	__host__ __device__ constexpr RGBA(uint8_t _r, uint8_t _g, uint8_t _b)
+	__device__ constexpr RGBA(uint8_t _r, uint8_t _g, uint8_t _b)
 	{
 		r = _r;
 		g = _g;
@@ -99,23 +53,41 @@ struct RGBA
 	}
 };
 
-struct PixelPrefab
+struct PixelState
 {
-	PixelData defaultData;
-	RGBA defaultColor;
+	RGBA color = RGBA();
+
+	Vec2f exactPos = { 0, 0 };
+	Vec2f velocity = { 0, 0 };
+
+	__device__ PixelState(const PixelState& copy)
+	{
+		memcpy(this, &copy, sizeof(PixelState));
+	}
+	__device__ constexpr PixelState() {}
+	__device__ constexpr PixelState(RGBA _c)
+	{
+		color = _c;
+	}
 };
 
-__device__ PixelPrefab AIR = { PixelData(0), RGBA(0, 0, 0) };
-__device__ PixelPrefab SAND = { PixelData(1, 10), RGBA(0xFF, 0xDF, 0x7F) };
-__device__ PixelPrefab WATER = { PixelData(2, 5), RGBA(0x00, 0x00, 0xFF) };
-__device__ PixelPrefab SNOW = { PixelData(3, 7), RGBA(0xFF, 0xFF, 0xFF) };
-__device__ PixelPrefab SMOKE = { PixelData(4, 1, false, 200), RGBA(0x5F, 0x5F, 0x5F) };
-__device__ PixelPrefab OIL = { PixelData(5, 2, true), RGBA(0x7F, 0x6F, 0x00) };
-__device__ PixelPrefab FIRE = { PixelData(6, 3, false, 10), RGBA(0xDF, 0x7F, 0x3F) };
+struct ChunkData
+{
+	bool lastUpdated;
+	bool updated;
+	bool reactionUpdated;
+};
 
-__device__ __constant__ RGBA* texture;
-__device__ __constant__ PixelData* pixelData;
+struct MaterialInfo
+{
+	RGBA meanColor;
+};
+
+__device__ __constant__ RGBA* pixelColors;
+__device__ __constant__ Material* mats;
+__device__ __constant__ PixelState* pixelStates;
 __device__ __constant__ ChunkData* chunkData;
+__device__ __constant__ bool* pixelsUpdated;
 
 __device__ __constant__ int w;
 __device__ __constant__ int h;
@@ -126,18 +98,20 @@ int hIters = 0;
 RGBA* hPixels;
 RGBA* dPixels;
 
-PixelData* dPixelData;
+Material* dMaterials;
+PixelState* dPixelData;
 ChunkData* dChunkData;
+bool* dPixelsUpdated;
 
 ChunkData* hChunkData;
 
 constexpr auto NUMBLOCKS = 256;
-constexpr auto BLOCKSIZE = 64;
+constexpr auto BLOCKSIZE = 128;
 
-constexpr auto CHUNKDIM = 16;
+constexpr auto CHUNKDIM = 8;
 constexpr auto REACTION_RATE = 8;
 
-constexpr auto DOWNSCALE = 1;
-constexpr auto LOOPCOUNT = 5;
+constexpr auto DOWNSCALE = 1.0f;
+constexpr auto LOOPCOUNT = 1;
 
-constexpr auto INPUT_RADIUS = 3;
+constexpr auto INPUT_RADIUS = 0;

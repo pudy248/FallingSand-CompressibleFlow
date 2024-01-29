@@ -1,9 +1,19 @@
 #pragma once
 
 #include "pixelDatatypes.h"
+#include "pixelDataImpl.h"
 #include "xoshiro.h"
 
 #include <cmath>
+
+__device__ constexpr int midx(int x, int y)
+{
+	return ((y + h) % h) * w + ((x + w) % w);
+}
+__device__ constexpr int idx(int x, int y)
+{
+	return y * w + x;
+}
 
 __device__ bool InvalidCoords(int x, int y)
 {
@@ -33,69 +43,7 @@ __device__ void TouchChunk(int x, int y)
 	else if (yDiff == CHUNKDIM - 1) TouchChunkHelper(x, y + 1);
 }
 
-__device__ void TouchReactionChunk(int x, int y)
-{
-	auto TouchChunkHelper = [](int _x, int _y)
-	{
-		int _chunkIdx = (_y / CHUNKDIM) * (w / CHUNKDIM + 1) + (_x / CHUNKDIM);
-		chunkData[_chunkIdx].reactionUpdated = true;
-		return _chunkIdx;
-	};
-
-	int chunkIdx = TouchChunkHelper(x, y);
-
-	int cx = chunkIdx % (w / CHUNKDIM + 1) * CHUNKDIM;
-	int cy = chunkIdx / (w / CHUNKDIM + 1) * CHUNKDIM;
-
-	int xDiff = x - cx;
-	int yDiff = y - cy;
-
-	if (xDiff == 0) TouchChunkHelper(x - 1, y);
-	else if (xDiff == CHUNKDIM - 1) TouchChunkHelper(x + 1, y);
-	if (yDiff == 0) TouchChunkHelper(x, y - 1);
-	else if (yDiff == CHUNKDIM - 1) TouchChunkHelper(x, y + 1);
-}
-
-__device__ PixelData* GetPixelData(int x, int y)
-{
-	return pixelData + (y * w + x);
-}
-
-__device__ RGBA GetPixelColor(int x, int y)
-{
-	return texture[y * w + x];
-}
-
-__device__ void SetPixelColor(RGBA c, int x, int y)
-{
-	texture[y * w + x] = c;
-	TouchChunk(x, y);
-}
-
-__device__ void SetPixelData(PixelData data, int x, int y)
-{
-	pixelData[y * w + x] = data;
-	TouchChunk(x, y);
-}
-
-__device__ bool PixelUpdated(int x, int y)
-{
-	return GetPixelData(x, y)->updated;
-}
-
-__device__ void SwapPixels(int x1, int y1, int x2, int y2)
-{
-	if (InvalidCoords(x1, y1) || InvalidCoords(x2, y2)) return;
-	RGBA colorTemp = GetPixelColor(x1, y1);
-	SetPixelColor(GetPixelColor(x2, y2), x1, y1);
-	SetPixelColor(colorTemp, x2, y2);
-
-	PixelData dataTemp = *GetPixelData(x1, y1);
-	*GetPixelData(x1, y1) = *GetPixelData(x2, y2);
-	*GetPixelData(x2, y2) = dataTemp;
-}
-
-__device__ RGBA randomizeColor(RGBA base, const int variation, uint seed)
+__device__ RGBA randomizeColor(const RGBA base, const int variation, const uint seed)
 {
 	uint PCG_state = seed;
 	PCG_state = PCG32_hash(PCG_state);
@@ -110,174 +58,141 @@ __device__ RGBA randomizeColor(RGBA base, const int variation, uint seed)
 	return RGBA(r, g, b);
 }
 
-__device__ void SetPixelFromPrefab(PixelPrefab prefab, int x, int y)
+__device__ void SetPixel_Mat(Material mat, int x, int y)
 {
-	uint pixelIdx = y * w + x;
-	uint PCG_state = PCG32_hash(PCG32_hash(pixelIdx) * PCG32_hash(dIters) + 37);
-	RGBA color = randomizeColor(prefab.defaultColor, 16, PCG_state);
-	SetPixelColor(color, x, y);
-	SetPixelData(prefab.defaultData, x, y);
-	TouchReactionChunk(x, y);
+	mats[idx(x, y)] = mat;
+	uint PCG_state = PCG32_hash(PCG32_hash(idx(x, y)) * PCG32_hash(dIters) + 37);
+	RGBA c = RGBA();
+	if(mat != AIR) c = randomizeColor(materials[mat].meanColor, 16, PCG_state);
+	pixelStates[idx(x, y)] = PixelState(c);
+	pixelStates[idx(x, y)].exactPos = Vec2f(x, y);
+	TouchChunk(x, y);
 }
 
-
-
-__device__ bool TrySwapDown(int x, int y, PixelData data)
+__device__ void MoveTo(int x1, int y1, int x2, int y2)
 {
-	bool bottomOpen = false;
-	if (!InvalidCoords(x, y + 1)) bottomOpen = GetPixelData(x, y + 1)->density < data.density;
-
-	if (bottomOpen)
-	{
-		SwapPixels(x, y, x, y + 1);
-		return true;
-	}
-	return false;
+	mats[midx(x2, y2)] = mats[idx(x1, y1)];
+	pixelStates[midx(x2, y2)] = pixelStates[idx(x1, y1)];
+	SetPixel_Mat(AIR, x1, y1);
+	TouchChunk(x2, y2);
 }
 
-__device__ bool TrySwapDownDiag(int x, int y, PixelData data)
+__device__ Vec2f ApplyForces(int x, int y, float dt)
 {
-	bool downLeftOpen = false;
-	if (!InvalidCoords(x - 1, y + 1)) downLeftOpen = GetPixelData(x - 1, y + 1)->density < data.density;
-	bool downRightOpen = false;
-	if (!InvalidCoords(x + 1, y + 1)) downRightOpen = GetPixelData(x + 1, y + 1)->density < data.density;
+	Vec2f v = pixelStates[idx(x, y)].velocity;
 
-	if (downLeftOpen && downRightOpen)
-	{
-		uint pixelIdx = y * w + x;
-		uint PCG = PCG32_hash(PCG32_hash(pixelIdx) + dIters);
-		if (toFloat01(PCG) < 0.5f) downLeftOpen = false;
-		else downRightOpen = false;
-	}
+	const Vec2f gravity = { 0, 0.3f };
+	v = v + dt * gravity * (1 + (0.1f * toFloat01(PCG32_hash(PCG32_hash(x * 1253 + y % 2314 + dIters * 23891)))));
 
-	if (downLeftOpen)
-	{
-		SwapPixels(x, y, x - 1, y + 1);
-		return true;
-	}
+	float m = v.magnitude();
+	if (m > ((CHUNKDIM >> 1) / dt)) v = v * ((CHUNKDIM >> 1) / (dt * m));
 
-	if (downRightOpen)
-	{
-		SwapPixels(x, y, x + 1, y + 1);
-		return true;
-	}
-	return false;
+	return v;
 }
 
-__device__ bool TrySwapDownVel(int x, int y, int velocity, PixelData data)
+__device__ Vec2f ProjectVelocity(int x, int y, Vec2f velocity)
 {
-	int downVel = 0;
-	bool downOpen;
-	do
-	{
-		downVel++;
-		downOpen = false;
-		if (!InvalidCoords(x, y + downVel)) downOpen = GetPixelData(x, y + downVel)->density < data.density;
-	} while (downOpen && downVel <= velocity);
+	bool dOpen = mats[midx(x, y + 1)] == AIR;
+	if (dOpen) return velocity;
 
-	downVel--;
-	downOpen = false;
-	if (!InvalidCoords(x, y + downVel)) downOpen = GetPixelData(x, y + downVel)->density < data.density;
-
-	if (downOpen)
+	bool dLOpen = mats[midx(x - 1, y + 1)] == AIR;
+	bool dROpen = mats[midx(x + 1, y + 1)] == AIR;
+	if (dLOpen && dROpen)
 	{
-		SwapPixels(x, y, x, y + downVel);
-		return true;
+		float a = velocity.angle();
+		if (a > 90 && a < 270 - 10) dROpen = false;
+		else if (a > 270 + 10) dLOpen = false;
+		else
+		{
+			uint n = PCG32_hash(x * dIters + y * 187 + *(int*)&velocity.y);
+			bool b = (PCG32_hash(n) & (1 << (dIters % 30))) > 0;
+			if (b) dLOpen = false;
+			else dROpen = false;
+		}
 	}
+	if (dLOpen || dROpen)
+	{
+		pixelStates[idx(x, y)].exactPos.y = fminf(pixelStates[idx(x, y)].exactPos.y, ceilf(pixelStates[idx(x, y)].exactPos.y) - 0.2f);
 
-	return false;
+		Vec2f belowVel = pixelStates[midx(x, y + 1)].velocity;
+		Vec2f velDiff = velocity - belowVel;
+
+		float magnitude = velDiff.magnitude();
+		float adjustedMagnitude = sqrtf(magnitude * 3 + 0.01f) + 0.5f;
+		Vec2f v = Vec2f(0.707f, 0.707f) * adjustedMagnitude;
+		if (dLOpen) v.x *= -1;
+		return v + (belowVel * 1.0f);
+	}
+	return Vec2f(0, 0);
 }
 
-__device__ bool TrySwapHorizontal(int x, int y, int velocity, PixelData data)
+__device__ void MoveWithVelocity(int x, int y, Vec2f velocity, float dt)
 {
-	int leftVel = 0;
-	bool leftOpen;
-	do
+	if (velocity == Vec2f(0, 0)) return;
+
+	constexpr int velLoops = 8;
+
+	Vec2f origPos = pixelStates[idx(x, y)].exactPos;
+	Vec2i lastPos = Vec2i(origPos);
+	Vec2i newPos;
+	Vec2f preciseNewPos = origPos;
+
+	for(int i = 1; i <= velLoops; i++)
 	{
-		leftVel++;
-		leftOpen = false;
-		if (!InvalidCoords(x - leftVel, y)) leftOpen = GetPixelData(x - leftVel, y)->density < data.density;
-	} while (leftOpen && leftVel <= velocity);
+		preciseNewPos += velocity * (dt / velLoops);
+		newPos = Vec2i(preciseNewPos);
+		
+		if (newPos != lastPos)
+		{
+			if (InvalidCoords(newPos.x, newPos.y)) {
+				Vec2f actualVel = velocity * ((float)i / velLoops);
+				pixelStates[idx(x, y)].velocity = actualVel;
+				preciseNewPos -= velocity * (dt / velLoops);
+				break;
+			}
+			if (mats[midx(newPos.x, newPos.y)] > AIR) {
+				bool moved = true;
+				if (fabsf(velocity.x) > fabsf(velocity.y)) {
+					int delta = (velocity.x > 0) * 2 - 1;
+					if (mats[midx(newPos.x + delta, newPos.y)] == AIR) preciseNewPos.x = (int)preciseNewPos.x + 1.5f * delta;
+					else if (mats[midx(newPos.x - delta, newPos.y)] == AIR) preciseNewPos.x = (int)preciseNewPos.x - 0.5f * delta;
+					else moved = false;
+				}
+				else {
+					int delta = (velocity.y > 0) * 2 - 1;
+					if (mats[midx(newPos.x, newPos.y + delta)] == AIR) preciseNewPos.y = (int)preciseNewPos.y + 1.5f * delta;
+					else if (mats[midx(newPos.x, newPos.y - delta)] == AIR) preciseNewPos.y = (int)preciseNewPos.y - 0.5f * delta;
+					else moved = false;
+				}
 
-	leftVel--;
-	leftOpen = false;
-	if (!InvalidCoords(x - leftVel, y)) leftOpen = GetPixelData(x - leftVel, y)->density < data.density;
-
-
-	int rightVel = 0;
-	bool rightOpen;
-	do
-	{
-		rightVel++;
-		rightOpen = false;
-		if (!InvalidCoords(x + rightVel, y)) rightOpen = GetPixelData(x + rightVel, y)->density < data.density;
-	} while (rightOpen && rightVel <= velocity);
-
-	rightVel--;
-	rightOpen = false;
-	if (!InvalidCoords(x + rightVel, y)) rightOpen = GetPixelData(x + rightVel, y)->density < data.density;
-
-
-	if (leftOpen && rightOpen)
-	{
-		uint pixelIdx = y * w + x;
-		uint PCG = PCG32_hash(PCG32_hash(pixelIdx) + dIters);
-		if (toFloat01(PCG) < 0.5f) leftOpen = false;
-		else rightOpen = false;
+				if (!moved) {
+					Vec2f actualVel = velocity * ((float)i / velLoops);
+					pixelStates[idx(x, y)].velocity = actualVel;
+					preciseNewPos -= velocity * (dt / velLoops);
+					break;
+				}
+				i += 2;
+			}
+			lastPos = newPos;
+		}
 	}
 
-	if (leftOpen)
-	{
-		SwapPixels(x, y, x - leftVel, y);
-		return true;
-	}
+	//if (i < velLoops) //collision
+	//{
+	//	Vec2f actualVel = velocity * ((float)i / velLoops);
+	//	pixelStates[idx(x, y)].velocity = actualVel;
+	//}
 
-	if (rightOpen)
-	{
-		SwapPixels(x, y, x + rightVel, y);
-		return true;
-	}
-	return false;
-}
+	preciseNewPos.x = fmodf(preciseNewPos.x, w);
+	preciseNewPos.y = fmodf(preciseNewPos.y, h);
 
-__device__ bool TrySwapUpDiag(int x, int y, PixelData data)
-{
-	bool upLeftOpen = false;
-	if (!InvalidCoords(x - 1, y - 1)) upLeftOpen = GetPixelData(x - 1, y - 1)->density < data.density;
-	bool upRightOpen = false;
-	if (!InvalidCoords(x + 1, y - 1)) upRightOpen = GetPixelData(x + 1, y - 1)->density < data.density;
+	pixelStates[idx(x, y)].exactPos = preciseNewPos;
 
-	if (upLeftOpen && upRightOpen)
-	{
-		uint pixelIdx = y * w + x;
-		uint PCG = PCG32_hash(PCG32_hash(pixelIdx) + dIters);
-		if (toFloat01(PCG) < 0.5f) upLeftOpen = false;
-		else upRightOpen = false;
-	}
+	TouchChunk(x, y);
 
-	if (upLeftOpen)
-	{
-		SwapPixels(x, y, x - 1, y - 1);
-		return true;
-	}
+	//if((preciseLastPos - origPos).magnitude() > 0.01f && PCG32_hash(PCG32_hash(x * 8135 + y % 87)) < 100000)
+	//	printf("this delta: %f %f\n", preciseLastPos.x - origPos.x, preciseLastPos.y - origPos.y);
 
-	if (upRightOpen)
-	{
-		SwapPixels(x, y, x + 1, y - 1);
-		return true;
-	}
-	return false;
-}
-
-__device__ bool TrySwapUp(int x, int y, PixelData data)
-{
-	bool topOpen = false;
-	if (!InvalidCoords(x, y - 1)) topOpen = GetPixelData(x, y - 1)->density < data.density;
-
-	if (topOpen)
-	{
-		SwapPixels(x, y, x, y - 1);
-		return true;
-	}
-	return false;
+	if(Vec2i(x, y) != Vec2i(preciseNewPos))
+		MoveTo(x, y, (int)preciseNewPos.x, (int)preciseNewPos.y);
 }

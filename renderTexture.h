@@ -26,43 +26,42 @@ struct MouseInput
 __global__ void HandleInput(MouseInput input)
 {
 	if (input.lmbDown)
+	{
 		for (int xOffset = -INPUT_RADIUS; xOffset <= INPUT_RADIUS; xOffset++)
 		{
 			for (int yOffset = -INPUT_RADIUS; yOffset <= INPUT_RADIUS; yOffset++)
 			{
-				if (InvalidCoords(input.x + xOffset, input.y + yOffset)) continue;
-				SetPixelFromPrefab(OIL, input.x + xOffset, input.y + yOffset);
+				int x = input.x + xOffset;
+				int y = input.y + yOffset;
+				if (InvalidCoords(x, y)) continue;
+				SetPixel_Mat(SAND, x, y);
+				pixelStates[idx(x, y)].velocity = Vec2f(0, 10);
 			}
 		}
-	else if (input.rmbDown)
-		for (int xOffset = -INPUT_RADIUS; xOffset <= INPUT_RADIUS; xOffset++)
-		{
-			for (int yOffset = -INPUT_RADIUS; yOffset <= INPUT_RADIUS; yOffset++)
-			{
-				if (InvalidCoords(input.x + xOffset, input.y + yOffset)) continue;
-				SetPixelFromPrefab(FIRE, input.x + xOffset, input.y + yOffset);
-			}
-		}
+	}
 }
 
-__global__ void TextureDiffusePass(double t, int pass)
+__global__ void TextureUpdate(float dt, int pass, bool doSpawning)
 {
 	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t stride = blockDim.x * gridDim.x;
 
 	if (index == 0 && pass == 0)
 	{
+		//Vec2f v = Vec2f(1, 1).project(Vec2f(-1, -1));
+		//printf("%f %f\n", v.x, v.y);
+
 		dIters++;
 
-		if (dIters % 3 == 0)
+		int modCount = 1 / dt;
+
+		if (dIters % modCount == 0 && doSpawning)
 		{
-			SetPixelFromPrefab(SAND, 200, 200);
-			if (t > 5)
-			{
-				SetPixelFromPrefab(OIL, 300, 200);
-			}
+			SetPixel_Mat(SAND, 200, 200);
+			pixelStates[idx(200, 200)].velocity = Vec2f(10, 0);
 		}
 	}
+	//return;
 
 	__syncthreads();
 
@@ -78,38 +77,24 @@ __global__ void TextureDiffusePass(double t, int pass)
 		int baseX = cx * CHUNKDIM + xOffset;
 		int baseY = cy * CHUNKDIM + yOffset;
 
-		for (int px = baseX; px < baseX + (CHUNKDIM / 2); px++)
+		for (int x = baseX; x < baseX + (CHUNKDIM / 2); x++)
 		{
-			for (int py = baseY; py < baseY + (CHUNKDIM / 2); py++)
+			for (int y = baseY + (CHUNKDIM / 2) - 1; y >= baseY ; y--)
 			{
-				FallingSandUpdate(px, py, t);
+				FallingSandUpdate(x, y, dt);
 			}
 		}
 	}
 }
 
-__global__ void UpdateReactions(double t)
+__global__ void TextureRender()
 {
 	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t stride = blockDim.x * gridDim.x;
 
-	for (int chunkIdx = index; chunkIdx < (w / CHUNKDIM + 1) * (h / CHUNKDIM + 1); chunkIdx += stride)
+	for (int pix = index; pix < w * h; pix += stride)
 	{
-		if (!chunkData[chunkIdx].reactionUpdated) continue;
-		chunkData[chunkIdx].reactionUpdated = false;
-		int cx = chunkIdx % (w / CHUNKDIM + 1);
-		int cy = chunkIdx / (w / CHUNKDIM + 1);
-
-		int baseX = cx * CHUNKDIM;
-		int baseY = cy * CHUNKDIM;
-
-		for (int px = baseX; px < baseX + CHUNKDIM; px++)
-		{
-			for (int py = baseY; py < baseY + CHUNKDIM; py++)
-			{
-				PixelReactionUpdate(px, py, t);
-			}
-		}
+		pixelColors[pix] = pixelStates[pix].color;
 	}
 }
 
@@ -117,14 +102,6 @@ __global__ void ResetUpdates()
 {
 	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t stride = blockDim.x * gridDim.x;
-
-	for (int pix = index; pix < w * h; pix += stride)
-	{
-		int x = pix % w;
-		int y = pix / w;
-
-		GetPixelData(x, y)->updated = false;
-	}
 
 	for (int chunk = index; chunk < (w / CHUNKDIM + 1) * (h / CHUNKDIM + 1); chunk += stride)
 	{
@@ -139,7 +116,9 @@ __global__ void InitTexture(uint64_t seed)
 	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t stride = blockDim.x * gridDim.x;
 
-	for (int pix = index * 8; pix < w * h; pix += stride * 8)
+	constexpr int groupSize = 4;
+
+	for (int pix = index * groupSize; pix < w * h; pix += stride * groupSize)
 	{
 		int x = pix % w;
 		int y = pix / w;
@@ -148,15 +127,24 @@ __global__ void InitTexture(uint64_t seed)
 
 		uint64_t num[1] = { rnd.NextU() };
 		uint8_t* bytes = (uint8_t*)num;
-		for (int i = 0; i < 8; i++)
+		for (int i = 0; i < groupSize; i++)
 		{
-			uint8_t b = bytes[i];
+			uint8_t b = bytes[2 * i];
+			uint8_t b2 = bytes[2 * i + 1];
 			int x2 = (pix + i) % w;
 			int y2 = (pix + i) / w;
 
-			if (b < 220) SetPixelFromPrefab(AIR, x2, y2);
-			else if(b < 230) SetPixelFromPrefab(SAND, x2, y2);
-			else SetPixelFromPrefab(OIL, x2, y2);
+			bool isWall = y2 == h - 1;
+			isWall |= y2 == 600 && x < 400 && x > 300;
+
+			bool isSand = b > 245;
+
+			Material m = AIR;
+			if (isSand) m = SAND;
+			if (isWall) m = WALL;
+
+
+			SetPixel_Mat(m, x2, y2);
 		}
 	}
 
@@ -177,12 +165,16 @@ void texInit(const int _width, const int _height)
 	hChunkData = (ChunkData*)malloc((width / CHUNKDIM + 1) * (height / CHUNKDIM + 1) * sizeof(ChunkData));
 
 	checkCudaErrors(cudaMalloc(&dPixels, width * height * 4));
-	checkCudaErrors(cudaMalloc(&dPixelData, width * height * sizeof(PixelData)));
+	checkCudaErrors(cudaMalloc(&dMaterials, width * height * sizeof(Material)));
+	checkCudaErrors(cudaMalloc(&dPixelData, width * height * sizeof(PixelState)));
 	checkCudaErrors(cudaMalloc(&dChunkData, (width / CHUNKDIM + 1) * (height / CHUNKDIM + 1) * sizeof(ChunkData)));
+	checkCudaErrors(cudaMalloc(&dPixelsUpdated, width * height));
 
-	checkCudaErrors(cudaMemcpyToSymbol(texture, &dPixels, sizeof(RGBA*)));
-	checkCudaErrors(cudaMemcpyToSymbol(pixelData, &dPixelData, sizeof(PixelData*)));
+	checkCudaErrors(cudaMemcpyToSymbol(pixelColors, &dPixels, sizeof(RGBA*)));
+	checkCudaErrors(cudaMemcpyToSymbol(mats, &dMaterials, sizeof(Material*)));
+	checkCudaErrors(cudaMemcpyToSymbol(pixelStates, &dPixelData, sizeof(PixelState*)));
 	checkCudaErrors(cudaMemcpyToSymbol(chunkData, &dChunkData, sizeof(ChunkData*)));
+	checkCudaErrors(cudaMemcpyToSymbol(pixelsUpdated, &dPixelsUpdated, sizeof(bool*)));
 
 	checkCudaErrors(cudaMemcpyToSymbol(w, &width, sizeof(int)));
 	checkCudaErrors(cudaMemcpyToSymbol(h, &height, sizeof(int)));
@@ -196,13 +188,15 @@ void texInit(const int _width, const int _height)
 
 void texRender(RenderWindow& window, const int _width, const int _height, const float totalSeconds)
 {
+	hIters++;
 	int width = _width / DOWNSCALE;
 	int height = _height / DOWNSCALE;
 
 	MouseInput mouseInput = { Mouse::isButtonPressed(Mouse::Left), Mouse::isButtonPressed(Mouse::Right), Mouse::getPosition().x / DOWNSCALE, Mouse::getPosition().y / DOWNSCALE };
-	HandleInput << <1, 1 >> > (mouseInput);
+	HandleInput<<<1, 1>>>(mouseInput);
 
 	bool paused = Keyboard::isKeyPressed(Keyboard::Space);
+	bool spawning = !Keyboard::isKeyPressed(Keyboard::Tilde);
 	if (!paused)
 	{
 		for (int loops = 0; loops < LOOPCOUNT; loops++)
@@ -210,28 +204,28 @@ void texRender(RenderWindow& window, const int _width, const int _height, const 
 			hIters++;
 			ResetUpdates << <NUMBLOCKS, BLOCKSIZE >> > ();
 			checkCudaErrors(cudaDeviceSynchronize());
-
-			if (hIters % REACTION_RATE == 0)
-			{
-				UpdateReactions << <NUMBLOCKS, BLOCKSIZE >> > (totalSeconds);
-				checkCudaErrors(cudaDeviceSynchronize());
-			}
+			cudaMemset(dPixelsUpdated, 0, width * height);
 
 			for (int pass = 0; pass < 4; pass++)
 			{
-				TextureDiffusePass << <NUMBLOCKS, BLOCKSIZE >> > (totalSeconds, pass);
+				TextureUpdate << <NUMBLOCKS, BLOCKSIZE >> > (0.2f, pass, spawning);
 				checkCudaErrors(cudaDeviceSynchronize());
 			}
 		}
 	}
+	TextureRender<<<NUMBLOCKS, BLOCKSIZE>>>();
+
 	checkCudaErrors(cudaMemcpy(hPixels, dPixels, 4 * width * height, cudaMemcpyDeviceToHost));
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	//Drawing
-	tex.update((uint8_t*)hPixels);
-	Sprite sprite = Sprite(tex);
-	sprite.setScale(Vector2f(DOWNSCALE, DOWNSCALE));
-	window.draw(sprite);
+	if (1) {
+		if (!(hIters % 4))
+			tex.update((uint8_t*)hPixels);
+		Sprite sprite = Sprite(tex);
+		sprite.setScale(Vector2f(DOWNSCALE, DOWNSCALE));
+		window.draw(sprite);
+	}
 
 	//Chunk Updater 9000
 	if (Keyboard::isKeyPressed(Keyboard::Tab))
@@ -243,7 +237,8 @@ void texRender(RenderWindow& window, const int _width, const int _height, const 
 		for (int chunkIdx = 0; chunkIdx < (width / CHUNKDIM + 1) * (height / CHUNKDIM + 1); chunkIdx++)
 		{
 			ChunkData dat = hChunkData[chunkIdx];
-			if (!dat.updated && !dat.reactionUpdated) continue;
+			if (!dat.updated)// && !dat.reactionUpdated) 
+				continue;
 
 			if(dat.updated)
 				loadedChunks++;
@@ -294,8 +289,10 @@ void texRender(RenderWindow& window, const int _width, const int _height, const 
 void texCleanup()
 {
 	cudaFree(dPixels);
+	cudaFree(dMaterials);
 	cudaFree(dPixelData);
 	cudaFree(dChunkData);
+	cudaFree(dPixelsUpdated);
 	free(hPixels);
 	free(hChunkData);
 }
