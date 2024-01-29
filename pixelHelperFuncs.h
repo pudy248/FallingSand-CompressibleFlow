@@ -61,12 +61,12 @@ __device__ PixelData* GetPixelData(int x, int y)
 	return pixelData + (y * w + x);
 }
 
-__device__ RGBA GetPixel(int x, int y)
+__device__ RGBA GetPixelColor(int x, int y)
 {
 	return texture[y * w + x];
 }
 
-__device__ void SetPixel(RGBA c, int x, int y)
+__device__ void SetPixelColor(RGBA c, int x, int y)
 {
 	texture[y * w + x] = c;
 	TouchChunk(x, y);
@@ -86,9 +86,9 @@ __device__ bool PixelUpdated(int x, int y)
 __device__ void SwapPixels(int x1, int y1, int x2, int y2)
 {
 	if (InvalidCoords(x1, y1) || InvalidCoords(x2, y2)) return;
-	RGBA colorTemp = GetPixel(x1, y1);
-	SetPixel(GetPixel(x2, y2), x1, y1);
-	SetPixel(colorTemp, x2, y2);
+	RGBA colorTemp = GetPixelColor(x1, y1);
+	SetPixelColor(GetPixelColor(x2, y2), x1, y1);
+	SetPixelColor(colorTemp, x2, y2);
 
 	PixelData dataTemp = *GetPixelData(x1, y1);
 	*GetPixelData(x1, y1) = *GetPixelData(x2, y2);
@@ -115,7 +115,7 @@ __device__ void SetPixelFromPrefab(PixelPrefab prefab, int x, int y)
 	uint pixelIdx = y * w + x;
 	uint PCG_state = PCG32_hash(PCG32_hash(pixelIdx) * PCG32_hash(dIters) + 37);
 	RGBA color = randomizeColor(prefab.defaultColor, 16, PCG_state);
-	SetPixel(color, x, y);
+	SetPixelColor(color, x, y);
 	SetPixelData(prefab.defaultData, x, y);
 	TouchReactionChunk(x, y);
 }

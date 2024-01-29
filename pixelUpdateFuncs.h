@@ -11,7 +11,7 @@ __device__ void FallingSandUpdate(int x, int y, int t)
 	uint8_t id = GetPixelData(x, y)->id;
 	if (id == 0) return;
 
-	RGBA currentPix = GetPixel(x, y);
+	RGBA currentPix = GetPixelColor(x, y);
 	GetPixelData(x, y)->updated = true;
 
 	PixelData data = *GetPixelData(x, y);
@@ -70,7 +70,7 @@ __device__ void PixelReactionUpdate(int x, int y, int t)
 	uint8_t id = GetPixelData(x, y)->id;
 	if (id == 0) return;
 
-	RGBA currentPix = GetPixel(x, y);
+	RGBA currentPix = GetPixelColor(x, y);
 
 	PixelData data = *GetPixelData(x, y);
 	uint pixelIdx = y * w + x;
@@ -125,7 +125,7 @@ __device__ void PixelReactionUpdate(int x, int y, int t)
 			int g = FIRE.defaultColor.g - 12 * (10 - data.lifetime);
 			int b = FIRE.defaultColor.b - 7 * (10 - data.lifetime);
 			RGBA randomized = randomizeColor(RGBA(r, g, b), 8, PCG_state);
-			SetPixel(randomized, x, y);
+			SetPixelColor(randomized, x, y);
 		}
 		if (GetPixelData(x, y)->lifetime <= 0)
 			SetPixelFromPrefab(SMOKE, x, y);

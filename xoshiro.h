@@ -43,7 +43,7 @@ struct Xoshiro256ssc
 	uint64_t state2;
 	uint64_t state3;
 
-	__host__ __device__ Xoshiro256ssc(uint64_t seed)
+	__host__ __device__ Xoshiro256ssc(uint64_t seed = 1)
 	{
 		world_seed = seed;
 		uint64_t sm = splitMix64(seed);
