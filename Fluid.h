@@ -97,7 +97,6 @@ struct RGBA
 
 struct PixelData
 {
-	float density[2] = { 0, 0 };
 	float pressure[2] = { 0, 0 };
 	Vec2f velocity[2] = { {0, 0}, {0, 0} };
 
@@ -128,11 +127,11 @@ RGBA* dPixels;
 
 PixelData* dPixelData;
 
-constexpr auto NUMBLOCKS = 256;
+constexpr auto NUMBLOCKS = 240;
 constexpr auto BLOCKSIZE = 128;
 
 constexpr auto DOWNSCALE = 1;
-constexpr auto LOOPCOUNT = 2;
+constexpr auto LOOPCOUNT = 1;
 
 constexpr auto INPUT_RADIUS = 5;
 
@@ -168,11 +167,11 @@ __device__ void SetPixelData(PixelData data, int x, int y)
 	pixelData[y * w + x] = data;
 }
 
-__device__ float GetDensity(int x, int y, float oob)
+__device__ float GetPressure(int x, int y, float oob)
 {
 	ModularizeCoords(x, y);
 	if (InvalidCoords(x, y)) return oob;
-	return GetPixelData(x, y)->density[0];
+	return GetPixelData(x, y)->pressure[0];
 }
 __device__ Vec2f GetVelocity(int x, int y, Vec2f oob, int axis)
 {
@@ -184,12 +183,6 @@ __device__ Vec2f GetVelocity(int x, int y, Vec2f oob, int axis)
 		else return { -oob.x, -oob.y };
 	}
 	return GetPixelData(x, y)->velocity[0];
-}
-__device__ float GetPressure(int x, int y, float oob)
-{
-	ModularizeCoords(x, y);
-	if (InvalidCoords(x, y)) return oob;
-	return GetPixelData(x, y)->pressure[0];
 }
 
 __global__ void HandleInput(MouseInput input)
@@ -211,7 +204,7 @@ __global__ void HandleInput(MouseInput input)
 			for (int yOffset = -INPUT_RADIUS; yOffset <= INPUT_RADIUS; yOffset++)
 			{
 				if (InvalidCoords(input.position.x + xOffset, input.position.y + yOffset)) continue;
-				GetPixelData(input.position.x + xOffset, input.position.y + yOffset)->pressure[0] += 1;
+				GetPixelData(input.position.x + xOffset, input.position.y + yOffset)->pressure[0] += 10;
 			}
 		}
 }
@@ -219,16 +212,16 @@ __global__ void HandleInput(MouseInput input)
 /*
 __device__ void PixelDiffusePass(int x, int y, double t)
 {
-	float defaultDensity = GetDensity(x, y, 0);
+	float defaultPressure = GetPressure(x, y, 0);
 	Vec2f defaultVelocity = GetVelocity(x, y, { 0, 0 }, 0);
 
 	double k = 0.1;
-	float s_n = (GetDensity(x - 1, y, defaultDensity) + GetDensity(x + 1, y, defaultDensity) +
-				 GetDensity(x, y - 1, defaultDensity) + GetDensity(x, y + 1, defaultDensity)) * 0.25f;
+	float s_n = (GetPressure(x - 1, y, defaultPressure) + GetPressure(x + 1, y, defaultPressure) +
+				 GetPressure(x, y - 1, defaultPressure) + GetPressure(x, y + 1, defaultPressure)) * 0.25f;
 
-	float d_c = GetDensity(x, y, 0);
+	float d_c = GetPressure(x, y, 0);
 	float d_n = (d_c + k * s_n) / (1 + k);
-	GetPixelData(x, y)->density[1] = d_n;
+	GetPixelData(x, y)->pressure[1] = d_n;
 
 	Vec2f vels_n = (GetVelocity(x - 1, y, defaultVelocity, 0) + GetVelocity(x + 1, y, defaultVelocity, 0) +
 					GetVelocity(x, y - 1, defaultVelocity, 1) + GetVelocity(x, y + 1, defaultVelocity, 1)) * 0.25f;
@@ -268,17 +261,15 @@ __device__ void PixelAdvectPass(int x, int y, double t)
 	float BL = (1 - lastXFrac) * lastYFrac;
 	float BR = lastXFrac * lastYFrac;
 
-	data->density[1] = TL * GetDensity(lastXInt, lastYInt, data->density[0]) +
-		TR * GetDensity(lastXInt + 1, lastYInt, data->density[0]) +
-		BL * GetDensity(lastXInt, lastYInt + 1, data->density[0]) +
-		BR * GetDensity(lastXInt + 1, lastYInt + 1, data->density[0]);
+	data->pressure[1] = TL * GetPressure(lastXInt, lastYInt, data->pressure[0]) +
+		TR * GetPressure(lastXInt + 1, lastYInt, data->pressure[0]) +
+		BL * GetPressure(lastXInt, lastYInt + 1, data->pressure[0]) +
+		BR * GetPressure(lastXInt + 1, lastYInt + 1, data->pressure[0]);
 
 	data->velocity[1] = GetVelocity(lastXInt, lastYInt, data->velocity[0], 0) * TL +
 		GetVelocity(lastXInt + 1, lastYInt, data->velocity[0], 0) * TR +
 		GetVelocity(lastXInt, lastYInt + 1, data->velocity[0], 1) * BL +
 		GetVelocity(lastXInt + 1, lastYInt + 1, data->velocity[0], 2) * BR;
-
-	data->pressure[1] = data->density[1];
 }
 __global__ void TextureAdvectPass(double t)
 {
@@ -298,9 +289,9 @@ __device__ void PixelDivergencePass(int x, int y, double t)
 	Vec2f defaultVelocity = GetVelocity(x, y, { 0, 0 }, 0);
 
 	float velGradient = ((GetVelocity(x + 1, y, defaultVelocity, 0).x - GetVelocity(x - 1, y, defaultVelocity, 0).x) +
-		(GetVelocity(x, y + 1, defaultVelocity, 1).y - GetVelocity(x, y - 1, defaultVelocity, 1).y)) * 0.5f;
+		(GetVelocity(x, y + 1, defaultVelocity, 1).y - GetVelocity(x, y - 1, defaultVelocity, 1).y)) * 0.25f;
 
-	GetPixelData(x, y)->pressure[1] = (GetPressure(x - 1, y, 0) + GetPressure(x + 1, y, 0) + GetPressure(x, y - 1, 0) + GetPressure(x, y + 1, 0) - velGradient) * 0.25f;
+	GetPixelData(x, y)->pressure[1] = GetPressure(x, y, 0) - velGradient;
 }
 __global__ void TextureDivergencePass(double t)
 {
@@ -342,7 +333,6 @@ __global__ void CopyValues()
 	{
 		int x = pix % w;
 		int y = pix / w;
-		GetPixelData(x, y)->density[0] = GetPixelData(x, y)->density[1];
 		GetPixelData(x, y)->pressure[0] = GetPixelData(x, y)->pressure[1];
 		GetPixelData(x, y)->velocity[0] = GetPixelData(x, y)->velocity[1];
 	}
@@ -370,7 +360,7 @@ __global__ void DrawFluid()
 		rgb.g *= velMagn;
 		rgb.b *= velMagn;
 
-		float sigDensity = sigmoid(GetDensity(x, y, 0) * 2);
+		float sigPressure = sigmoid(GetPressure(x, y, 0) * 2);
 
 		RGBA color(rgb.r, rgb.g, rgb.b);
 		SetPixelColor(color, x, y);
@@ -394,12 +384,11 @@ __global__ void InitTexture(uint64_t seed)
 			int x2 = (pix + i) % w;
 			int y2 = (pix + i) / w;
 			PixelData* data = GetPixelData(x2, y2);
-			data->density[0] = data->density[1] = rnd.Next();
 			data->pressure[0] = data->pressure[1] = rnd.Next();
 			if (abs(y - h / 2) < h / 3)
 				data->velocity[0] = {100, rnd.Next() / 10 - 0.5f};
 			else
-				data->velocity[0] = {-100, rnd.Next() / 10 - 0.5f};
+				data->velocity[0] = {0, rnd.Next() / 10 - 0.5f};
 			//data->velocity = { rnd.Next() * 10 - 5, rnd.Next() * 10 - 5};
 		}
 	}
