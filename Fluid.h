@@ -26,9 +26,11 @@ struct Vec2f
 		y = _y;
 	}
 
-	__host__ __device__ Vec2f operator*(float scalar)
-	{
-		return { x * scalar, y * scalar };
+	__host__ __device__ friend Vec2f operator*(Vec2f rhs, float lhs) {
+		return { rhs.x * lhs, rhs.y * lhs };
+	}
+	__host__ __device__ friend Vec2f operator*(float rhs, Vec2f lhs) {
+		return lhs * rhs;
 	}
 
 	__host__ __device__ Vec2f operator+(Vec2f other)
@@ -47,7 +49,6 @@ struct Vec2f
 		return sqrtf(x * x + y * y);
 	}
 };
-
 struct RGBA
 {
 	uint8_t r = 0;
@@ -94,18 +95,13 @@ struct RGBA
 		return r == 0 && g == 0 && b == 0;
 	}
 };
-
 struct PixelData
 {
-	float pressure[2] = { 0, 0 };
-	Vec2f velocity[2] = { {0, 0}, {0, 0} };
-
-	__host__ __device__ constexpr PixelData()
-	{
-
-	}
+	float density = 0;
+	Vec2f velocity = { 0, 0 };
+	float nextDensity = 0;
+	Vec2f nextVelocity = { 0, 0 };
 };
-
 struct MouseInput
 {
 	bool lmbDown;
@@ -114,43 +110,63 @@ struct MouseInput
 	Vec2f velocity;
 };
 
-__device__ __constant__ RGBA* texture;
-__device__ __constant__ PixelData* pixelData;
+enum class BoundaryCondition {
+	Loop,
+	Fixed,
+	Reflect,
+};
 
 __device__ __constant__ int w;
 __device__ __constant__ int h;
 __device__ int dIters = 0;
 int hIters = 0;
 
+Texture tex;
 RGBA* hPixels;
 RGBA* dPixels;
-
 PixelData* dPixelData;
+__device__ __constant__ RGBA* texture;
+__device__ __constant__ PixelData* pixelData;
 
 constexpr auto NUMBLOCKS = 240;
 constexpr auto BLOCKSIZE = 128;
 
 constexpr auto DOWNSCALE = 1;
-constexpr auto LOOPCOUNT = 1;
+constexpr auto LOOPCOUNT = 2;
 
 constexpr auto INPUT_RADIUS = 5;
 
-constexpr bool LOOP_X = true;
-constexpr bool LOOP_Y = false;
+constexpr BoundaryCondition BOUNDARY_NX = BoundaryCondition::Loop;
+constexpr BoundaryCondition BOUNDARY_PX = BoundaryCondition::Loop;
+constexpr BoundaryCondition BOUNDARY_NY = BoundaryCondition::Fixed;
+constexpr BoundaryCondition BOUNDARY_PY = BoundaryCondition::Fixed;
 
-Texture tex;
-
-__device__ bool InvalidCoords(int x, int y)
-{
-	return (!LOOP_X && (x < 0 || x >= w)) || (!LOOP_Y && (y < 0 || y >= h));
-}
-__device__ void ModularizeCoords(int& x, int& y) {
-	if (LOOP_X) x = ((x % w) + w) % w;
-	if (LOOP_Y) y = ((y % h) + h) % h;
+__device__ static constexpr inline bool SetBoundary(int& c, int m, bool write, BoundaryCondition neg, BoundaryCondition pos) {
+	if (c <= 0) {
+		if (c == 0) {
+			return neg == BoundaryCondition::Fixed && write;
+		}
+		else {
+			if (neg == BoundaryCondition::Loop) c = m - 1;
+			return neg != BoundaryCondition::Loop;
+		}
+	}
+	else if (c >= m - 1) {
+		if (c == m - 1) {
+			return pos == BoundaryCondition::Fixed && write;
+		}
+		else {
+			if (pos == BoundaryCondition::Loop) c = 0;
+			return pos != BoundaryCondition::Loop;
+		}
+	}
+	else return false;
 }
 
 __device__ PixelData* GetPixelData(int x, int y)
 {
+	//if (x < 0 || x >= w || y < 0 || y >= h)
+	//	printf("OOB GPD: %i %i\n", x, y);
 	return pixelData + (y * w + x);
 }
 
@@ -167,31 +183,57 @@ __device__ void SetPixelData(PixelData data, int x, int y)
 	pixelData[y * w + x] = data;
 }
 
-__device__ float GetPressure(int x, int y, float oob)
-{
-	ModularizeCoords(x, y);
-	if (InvalidCoords(x, y)) return oob;
-	return GetPixelData(x, y)->pressure[0];
-}
-__device__ Vec2f GetVelocity(int x, int y, Vec2f oob, int axis)
-{
-	ModularizeCoords(x, y);
-	if (InvalidCoords(x, y))
-	{
-		if (axis == 0) return { -oob.x, oob.y };
-		else if(axis == 1) return { oob.x, -oob.y };
-		else return { -oob.x, -oob.y };
-	}
-	return GetPixelData(x, y)->velocity[0];
-}
+#define GetVal(fieldname, _x, _y, default) [&default](int x, int y) {\
+	if (SetBoundary(x, w, false, BOUNDARY_NX, BOUNDARY_PX)) return default;\
+	if (SetBoundary(y, h, false, BOUNDARY_NY, BOUNDARY_PY)) return default;\
+	return GetPixelData(x, y)->fieldname;\
+}(_x, _y)
 
-__global__ void HandleInput(MouseInput input)
-{
+#define SetVal(fieldname, _x, _y, val) [&val](int x, int y) {\
+	if (SetBoundary(x, w, true, BOUNDARY_NX, BOUNDARY_PX)) return;\
+	if (SetBoundary(y, h, true, BOUNDARY_NY, BOUNDARY_PY)) return;\
+	GetPixelData(x, y)->fieldname = val;\
+}(_x, _y)
+
+//#define PATTERNED_UPDATE
+#ifdef PATTERNED_UPDATE
+#define DefineTextureFunction(devFn)\
+__global__ void Texture_##devFn(bool odd, double t) {\
+	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;\
+	uint32_t stride = blockDim.x * gridDim.x;\
+	for (int pix = index; pix < w * h / 2; pix += stride) {\
+		int y = (pix * 2) / w;\
+		int x = pix % (w / 2);\
+		x = 2 * x + (y & 1) ^ odd;\
+		devFn(x, y, t);\
+	}\
+}
+#define CallTextureFunction(devFn, t)\
+Texture_##devFn<<<NUMBLOCKS, BLOCKSIZE>>>(false, t);\
+checkCudaErrors(cudaDeviceSynchronize());\
+Texture_##devFn<<<NUMBLOCKS, BLOCKSIZE>>>(true, t);\
+checkCudaErrors(cudaDeviceSynchronize());
+#else
+#define DefineTextureFunction(devFn)\
+__global__ void Texture_##devFn(double t) {\
+	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;\
+	uint32_t stride = blockDim.x * gridDim.x;\
+	for (int pix = index; pix < w * h; pix += stride) {\
+		int y = pix / w;\
+		int x = pix % w;\
+		devFn(x, y, t);\
+	}\
+}
+#define CallTextureFunction(devFn, t)\
+Texture_##devFn<<<NUMBLOCKS, BLOCKSIZE>>>(t);\
+checkCudaErrors(cudaDeviceSynchronize());
+#endif
+
+/*
+__global__ void HandleInput(MouseInput input) {
 	if (input.lmbDown)
-		for (int xOffset = -INPUT_RADIUS; xOffset <= INPUT_RADIUS; xOffset++)
-		{
-			for (int yOffset = -INPUT_RADIUS; yOffset <= INPUT_RADIUS; yOffset++)
-			{
+		for (int xOffset = -INPUT_RADIUS; xOffset <= INPUT_RADIUS; xOffset++) {
+			for (int yOffset = -INPUT_RADIUS; yOffset <= INPUT_RADIUS; yOffset++) {
 				if (InvalidCoords(input.position.x + xOffset, input.position.y + yOffset)) continue;
 				Vec2f vel = GetPixelData(input.position.x + xOffset, input.position.y + yOffset)->velocity[0] + input.velocity * 10;
 				GetPixelData(input.position.x + xOffset, input.position.y + yOffset)->velocity[0] = vel;
@@ -209,7 +251,6 @@ __global__ void HandleInput(MouseInput input)
 		}
 }
 
-/*
 __device__ void PixelDiffusePass(int x, int y, double t)
 {
 	float defaultPressure = GetPressure(x, y, 0);
@@ -230,25 +271,13 @@ __device__ void PixelDiffusePass(int x, int y, double t)
 	GetPixelData(x, y)->velocity[1] = veld_n;
 
 }
-__global__ void TextureDiffusePass(double t)
-{
-	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	uint32_t stride = blockDim.x * gridDim.x;
-
-	for (int pix = index; pix < w * h; pix += stride)
-	{
-		int x = pix % w;
-		int y = pix / w;
-		PixelDiffusePass(x, y, t);
-	}
-}
 */
 
-__device__ void PixelAdvectPass(int x, int y, double t)
+__device__ void Advect(int x, int y, double t)
 {
 	PixelData* data = GetPixelData(x, y);
-	float lastX = x - data->velocity[0].x * t;
-	float lastY = y - data->velocity[0].y * t;
+	float lastX = x - data->velocity.x * t;
+	float lastY = y - data->velocity.y * t;
 
 	int lastXInt = floorf(lastX);
 	int lastYInt = floorf(lastY);
@@ -261,82 +290,63 @@ __device__ void PixelAdvectPass(int x, int y, double t)
 	float BL = (1 - lastXFrac) * lastYFrac;
 	float BR = lastXFrac * lastYFrac;
 
-	data->pressure[1] = TL * GetPressure(lastXInt, lastYInt, data->pressure[0]) +
-		TR * GetPressure(lastXInt + 1, lastYInt, data->pressure[0]) +
-		BL * GetPressure(lastXInt, lastYInt + 1, data->pressure[0]) +
-		BR * GetPressure(lastXInt + 1, lastYInt + 1, data->pressure[0]);
+	float dD = data->density;
+	float nD =	TL * GetVal(density, lastXInt, lastYInt, dD) +
+				TR * GetVal(density, lastXInt + 1, lastYInt, dD) +
+				BL * GetVal(density, lastXInt, lastYInt + 1, dD) +
+				BR * GetVal(density, lastXInt + 1, lastYInt + 1, dD);
 
-	data->velocity[1] = GetVelocity(lastXInt, lastYInt, data->velocity[0], 0) * TL +
-		GetVelocity(lastXInt + 1, lastYInt, data->velocity[0], 0) * TR +
-		GetVelocity(lastXInt, lastYInt + 1, data->velocity[0], 1) * BL +
-		GetVelocity(lastXInt + 1, lastYInt + 1, data->velocity[0], 2) * BR;
+	Vec2f dV = data->velocity * -1;
+	Vec2f nV =	TL * GetVal(velocity, lastXInt, lastYInt, dV) +
+				TR * GetVal(velocity, lastXInt + 1, lastYInt, dV) +
+				BL * GetVal(velocity, lastXInt, lastYInt + 1, dV) +
+				BR * GetVal(velocity, lastXInt + 1, lastYInt + 1, dV);
+
+	SetVal(nextDensity, x, y, nD);
+	SetVal(nextVelocity, x, y, nV);
 }
-__global__ void TextureAdvectPass(double t)
+
+__device__ void AdvectCopy(int x, int y, double t) {
+	GetPixelData(x, y)->density = GetPixelData(x, y)->nextDensity;
+	GetPixelData(x, y)->velocity = GetPixelData(x, y)->nextVelocity;
+}
+
+__device__ void Divergence(int x, int y, double t)
 {
-	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	uint32_t stride = blockDim.x * gridDim.x;
+	constexpr float z = 0;
+	constexpr Vec2f nulVel = { 0, 0 };
+	Vec2f dV = GetVal(velocity, x, y, nulVel) * -1;
+	float dP = GetVal(density, x, y, z);
 
-	for (int pix = index; pix < w * h; pix += stride)
-	{
-		int x = pix % w;
-		int y = pix / w;
-		PixelAdvectPass(x, y, t);
-	}
+	float gradient = ((GetVal(velocity, x + 1, y, dV).x - GetVal(velocity, x - 1, y, dV).x) + 
+					  (GetVal(velocity, x, y + 1, dV).y - GetVal(velocity, x, y - 1, dV).y)) * 0.5f;
+	float avgP = (GetVal(density, x - 1, y, dP) + GetVal(density, x + 1, y, dP) +
+				GetVal(density, x, y - 1, dP) + GetVal(density, x, y + 1, dP)) * 0.25f;
+	
+	float nP = dP - gradient;
+	SetVal(density, x, y, nP);
 }
 
-__device__ void PixelDivergencePass(int x, int y, double t)
+__device__ void UpdateVel(int x, int y, double t)
 {
-	Vec2f defaultVelocity = GetVelocity(x, y, { 0, 0 }, 0);
+	constexpr float z = 0;
+	constexpr Vec2f nulVel = { 0, 0 };
+	float dP = GetVal(density, x, y, z);
+	Vec2f dV = GetVal(velocity, x, y, nulVel);
 
-	float velGradient = ((GetVelocity(x + 1, y, defaultVelocity, 0).x - GetVelocity(x - 1, y, defaultVelocity, 0).x) +
-		(GetVelocity(x, y + 1, defaultVelocity, 1).y - GetVelocity(x, y - 1, defaultVelocity, 1).y)) * 0.25f;
+	Vec2f gradP = { GetVal(density, x + 1, y, dP) - GetVal(density, x - 1, y, dP),
+		GetVal(density, x, y + 1, dP) - GetVal(density, x, y - 1, dP) };
+	Vec2f avgV = (GetVal(velocity, x - 1, y, dV) + GetVal(velocity, x + 1, y, dV) +
+		GetVal(velocity, x, y - 1, dV) + GetVal(velocity, x, y + 1, dV)) * 0.25f;
 
-	GetPixelData(x, y)->pressure[1] = GetPressure(x, y, 0) - velGradient;
-}
-__global__ void TextureDivergencePass(double t)
-{
-	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	uint32_t stride = blockDim.x * gridDim.x;
-
-	for (int pix = index; pix < w * h; pix += stride)
-	{
-		int x = pix % w;
-		int y = pix / w;
-		PixelDivergencePass(x, y, t);
-	}
+	Vec2f nV = dV + (gradP * -0.5f);
+	SetVal(velocity, x, y, nV);
 }
 
-__device__ void PixelUpdateVelocity(int x, int y, double t)
-{
-	Vec2f gradP((GetPressure(x + 1, y, 0) - GetPressure(x - 1, y, 0)) / 2, (GetPressure(x, y + 1, 0) - GetPressure(x, y - 1, 0)) / 2);
-	GetPixelData(x, y)->velocity[1] = GetPixelData(x, y)->velocity[0] + (gradP * -1);
-}
-__global__ void TextureUpdateVelocity(double t)
-{
-	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	uint32_t stride = blockDim.x * gridDim.x;
-
-	for (int pix = index; pix < w * h; pix += stride)
-	{
-		int x = pix % w;
-		int y = pix / w;
-		PixelUpdateVelocity(x, y, t);
-	}
-}
-
-__global__ void CopyValues()
-{
-	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	uint32_t stride = blockDim.x * gridDim.x;
-
-	for (int pix = index; pix < w * h; pix += stride)
-	{
-		int x = pix % w;
-		int y = pix / w;
-		GetPixelData(x, y)->pressure[0] = GetPixelData(x, y)->pressure[1];
-		GetPixelData(x, y)->velocity[0] = GetPixelData(x, y)->velocity[1];
-	}
-}
+DefineTextureFunction(Advect)
+DefineTextureFunction(AdvectCopy)
+DefineTextureFunction(Divergence)
+DefineTextureFunction(UpdateVel)
 
 __device__ float sigmoid(float x)
 {
@@ -346,21 +356,27 @@ __global__ void DrawFluid()
 {
 	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	uint32_t stride = blockDim.x * gridDim.x;
-
+	constexpr float z = 0;
+	constexpr Vec2f nulVel = { 0, 0 };
 	for (int pix = index; pix < w * h; pix += stride)
 	{
 		int x = pix % w;
 		int y = pix / w;
 
-		float velAngle = GetVelocity(x, y, { 0,0 }, 0).angle() / (2 * 3.1415926f);
-		float velMagn = fminf(1, GetVelocity(x, y, { 0,0 }, 0).magnitude() / 120.f);
-		UniversalColor tmp = { velAngle, 1, 0 };
-		UniversalColor rgb = hsl2rgb(tmp);
-		rgb.r *= velMagn;
-		rgb.g *= velMagn;
-		rgb.b *= velMagn;
+		float velAngle = GetVal(velocity, x, y, nulVel).angle() / (2 * 3.1415926f);
+		float velMagn = fminf(1, GetVal(velocity, x, y, nulVel).magnitude() / 120.f);
+		//UniversalColor tmp = { velAngle, 1, 0 };
+		//UniversalColor tmp = { 0, 0, velMagn };
 
-		float sigPressure = sigmoid(GetPressure(x, y, 0) * 2);
+		float dP = GetVal(density, x, y, z);
+		Vec2f gradP = { GetVal(density, x + 1, y, dP) - GetVal(density, x - 1, y, dP),
+			GetVal(density, x, y + 1, dP) - GetVal(density, x, y - 1, dP) };
+		float gpMagn = fminf(1, gradP.magnitude() / 6.f);
+		UniversalColor tmp = { 0, 0, gpMagn };
+
+		UniversalColor rgb = hsl2rgb(tmp);
+
+		float sigDensity = sigmoid(GetVal(density, x, y, z) * 2);
 
 		RGBA color(rgb.r, rgb.g, rgb.b);
 		SetPixelColor(color, x, y);
@@ -384,12 +400,16 @@ __global__ void InitTexture(uint64_t seed)
 			int x2 = (pix + i) % w;
 			int y2 = (pix + i) / w;
 			PixelData* data = GetPixelData(x2, y2);
-			data->pressure[0] = data->pressure[1] = rnd.Next();
+			
+			//data->velocity = data->nextVelocity = { 0, 0 };
+			//data->density = data->nextDensity = 0;
+			//if (800 < x2 && x2 < 850 && 650 < y2 && y2 < 700) data->density = data->nextDensity = 1000;
+			
+			data->density = data->nextDensity = rnd.Next();
 			if (abs(y - h / 2) < h / 3)
-				data->velocity[0] = {100, rnd.Next() / 10 - 0.5f};
+				data->velocity = data->nextVelocity = {100, rnd.Next()};
 			else
-				data->velocity[0] = {0, rnd.Next() / 10 - 0.5f};
-			//data->velocity = { rnd.Next() * 10 - 5, rnd.Next() * 10 - 5};
+				data->velocity = data->nextVelocity = {0, rnd.Next()};
 		}
 	}
 }
@@ -398,7 +418,7 @@ void texInit(const int _width, const int _height)
 {
 	int width = _width / DOWNSCALE;
 	int height = _height / DOWNSCALE;
-	int z = 0;
+	hIters = 0;
 
 	hPixels = (RGBA*)malloc(width * height * 4);
 	checkCudaErrors(cudaMalloc(&dPixels, width * height * 4));
@@ -408,10 +428,9 @@ void texInit(const int _width, const int _height)
 
 	checkCudaErrors(cudaMemcpyToSymbol(w, &width, sizeof(int)));
 	checkCudaErrors(cudaMemcpyToSymbol(h, &height, sizeof(int)));
-	checkCudaErrors(cudaMemcpyToSymbol(dIters, &z, sizeof(int)));
-	hIters = 0;
+	checkCudaErrors(cudaMemcpyToSymbol(dIters, &hIters, sizeof(int)));
 
-	InitTexture << <NUMBLOCKS, BLOCKSIZE >> > (1234);
+	InitTexture<<<NUMBLOCKS, BLOCKSIZE>>>(1234);
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	tex = Texture();
@@ -420,16 +439,18 @@ void texInit(const int _width, const int _height)
 
 Vec2f lastMPos = { 0, 0 };
 
-void texRender(RenderWindow& window, const int _width, const int _height, const float deltaT)
+
+void texRender(RenderWindow& window, const int _width, const int _height, float deltaT)
 {
 	int width = _width / DOWNSCALE;
 	int height = _height / DOWNSCALE;
+	deltaT = 0.01f;
 
 	Vec2f currentMPos(Mouse::getPosition().x / DOWNSCALE, Mouse::getPosition().y / DOWNSCALE);
 	Vec2f diff = currentMPos + (lastMPos * -1);
 	lastMPos = currentMPos;
 	MouseInput mouseInput = { Mouse::isButtonPressed(Mouse::Left), Mouse::isButtonPressed(Mouse::Right), currentMPos, diff };
-	HandleInput << <1, 1 >> > (mouseInput);
+	//HandleInput << <1, 1 >> > (mouseInput);
 
 	bool paused = Keyboard::isKeyPressed(Keyboard::Space);
 
@@ -437,23 +458,10 @@ void texRender(RenderWindow& window, const int _width, const int _height, const 
 	{
 		for (int gLoops = 0; gLoops < LOOPCOUNT; gLoops++)
 		{
-			hIters++;
-			//TextureDiffusePass << <NUMBLOCKS, BLOCKSIZE >> > (deltaT);
-			//checkCudaErrors(cudaDeviceSynchronize());
-			//CopyValues << <NUMBLOCKS, BLOCKSIZE >> > ();
-			//checkCudaErrors(cudaDeviceSynchronize());
-			TextureAdvectPass << <NUMBLOCKS, BLOCKSIZE >> > (deltaT);
-			checkCudaErrors(cudaDeviceSynchronize());
-			CopyValues << <NUMBLOCKS, BLOCKSIZE >> > ();
-			checkCudaErrors(cudaDeviceSynchronize());
-			TextureDivergencePass << <NUMBLOCKS, BLOCKSIZE >> > (deltaT);
-			checkCudaErrors(cudaDeviceSynchronize());
-			CopyValues << <NUMBLOCKS, BLOCKSIZE >> > ();
-			checkCudaErrors(cudaDeviceSynchronize());
-			TextureUpdateVelocity << <NUMBLOCKS, BLOCKSIZE >> > (deltaT);
-			checkCudaErrors(cudaDeviceSynchronize());
-			CopyValues << <NUMBLOCKS, BLOCKSIZE >> > ();
-			checkCudaErrors(cudaDeviceSynchronize());
+			CallTextureFunction(Advect, deltaT);
+			CallTextureFunction(AdvectCopy, deltaT);
+			CallTextureFunction(Divergence, deltaT);
+			CallTextureFunction(UpdateVel, deltaT);
 		}
 	}
 	DrawFluid << <NUMBLOCKS, BLOCKSIZE >> > ();
@@ -463,55 +471,11 @@ void texRender(RenderWindow& window, const int _width, const int _height, const 
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	//Drawing
-	tex.update((uint8_t*)hPixels);
+	hIters++;
+	if (hIters % 4 == 0) tex.update((uint8_t*)hPixels);
 	Sprite sprite = Sprite(tex);
 	sprite.setScale(Vector2f(DOWNSCALE, DOWNSCALE));
 	window.draw(sprite);
-
-	//Chunk Updater 9000
-	/*if (Keyboard::isKeyPressed(Keyboard::Tab))
-	{
-		int loadedChunks = 0;
-		checkCudaErrors(cudaMemcpy(hChunkData, dChunkData, (width / CHUNKDIM + 1) * (height / CHUNKDIM + 1) * sizeof(ChunkData), cudaMemcpyDeviceToHost));
-		checkCudaErrors(cudaDeviceSynchronize());
-		for (int chunkIdx = 0; chunkIdx < (width / CHUNKDIM + 1) * (height / CHUNKDIM + 1); chunkIdx++)
-		{
-			ChunkData dat = hChunkData[chunkIdx];
-
-			if (dat.updated)
-				loadedChunks++;
-
-			int cx = chunkIdx % (width / CHUNKDIM + 1);
-			int cy = chunkIdx / (width / CHUNKDIM + 1);
-
-			RectangleShape shape(Vector2f(CHUNKDIM * DOWNSCALE, CHUNKDIM * DOWNSCALE));
-			shape.setFillColor(Color(0, 0, 0, 0));
-			shape.setOutlineThickness(-1);
-
-			shape.setOutlineColor(Color(255, 255, 0));
-
-			shape.setPosition(Vector2f(cx * CHUNKDIM * DOWNSCALE, cy * CHUNKDIM * DOWNSCALE));
-			window.draw(shape);
-		}
-
-		RectangleShape bgRect(Vector2f(300, 200));
-		bgRect.setFillColor(Color(0, 0, 0, 128));
-		window.draw(bgRect);
-
-		Font arial;
-		arial.loadFromFile("arial.ttf");
-		Text chunkCounter;
-		chunkCounter.setFont(arial);
-		chunkCounter.setCharacterSize(18);
-		chunkCounter.setFillColor(Color::White);
-
-		char buffer[30];
-		sprintf(buffer, "%i/%i chunks loaded", loadedChunks, (width / CHUNKDIM + 1) * (height / CHUNKDIM + 1));
-		chunkCounter.setString(buffer);
-		chunkCounter.setPosition(Vector2f(0, 30));
-		window.draw(chunkCounter);
-
-	}*/
 }
 
 void texCleanup()

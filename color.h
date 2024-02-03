@@ -74,14 +74,14 @@ __host__ __device__ UniversalColor hsl2rgb(UniversalColor hsl) {
     UniversalColor result;
 
     if (abs(hsl.s) < 0.0001f) {
-        result.r = result.g = result.b = 255; // achromatic
+        result.r = result.g = result.b = hsl.l * 255; // achromatic
     }
     else {
         float q = hsl.s < 0.5f ? hsl.l * (1 + hsl.s) : hsl.l + hsl.s - hsl.l * hsl.s;
         float p = 2 * hsl.l - q;
-        result.r = hue2rgb(p, q, hsl.h + 1.f/3) * 255;
-        result.g = hue2rgb(p, q, hsl.h) * 255;
-        result.b = hue2rgb(p, q, hsl.h - 1.f/3) * 255;
+        result.r = hue2rgb(p, q, hsl.h + 1.f/3) * 255 * hsl.l;
+        result.g = hue2rgb(p, q, hsl.h) * 255 * hsl.l;
+        result.b = hue2rgb(p, q, hsl.h - 1.f/3) * 255 * hsl.l;
     }
 
     return result;

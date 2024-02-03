@@ -18,7 +18,7 @@ int main()
 	constexpr auto width = 1920;
 	constexpr auto height = 1080;
 
-	RenderWindow window(VideoMode(width, height), "SFML Window", Style::Fullscreen, ContextSettings(24U, 8U, 4U, 4U, 0U, sf::ContextSettings::Attribute::Default));
+	RenderWindow window(VideoMode(width, height), "SFML Window", Style::Default, ContextSettings(24U, 8U, 4U, 4U, 0U, sf::ContextSettings::Attribute::Default));
 	window.setPosition(Vector2i(0, 0));
 	window.setVerticalSyncEnabled(true);
 	
