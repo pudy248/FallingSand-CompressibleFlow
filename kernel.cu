@@ -13,15 +13,14 @@
 using namespace sf;
 using namespace std;
 
-int main()
-{
-	constexpr auto width = 1920;
-	constexpr auto height = 1080;
+int main() {
+	constexpr auto width = 1280;
+	constexpr auto height = 720;
 
 	RenderWindow window(VideoMode(width, height), "SFML Window", Style::Default, ContextSettings(24U, 8U, 4U, 4U, 0U, sf::ContextSettings::Attribute::Default));
 	window.setPosition(Vector2i(0, 0));
 	window.setVerticalSyncEnabled(true);
-	
+
 	texInit(width, height);
 	//verletInit(width, height);
 
@@ -53,25 +52,22 @@ int main()
 		//frameSeconds = fminf(frameSeconds, 1.0 / 60);
 
 		Event event;
-		while (window.pollEvent(event))
-		{
+		while (window.pollEvent(event)) {
 			if (event.type == Event::Closed)
 				window.close();
 		}
 
 		window.clear();
 
-		if (Keyboard::isKeyPressed(Keyboard::Z))
-		{
+		if (Keyboard::isKeyPressed(Keyboard::Z)) {
 			texCleanup();
 			texInit(width, height);
 		}
-		else
-		{
+		else {
 			texRender(window, width, height, (float)frameSeconds);
 			//verletRender(window, width, height, 1 / 60.0f);
 		}
-		
+
 		keyToggle = Keyboard::isKeyPressed(Keyboard::Z);
 
 		//FPS counter
